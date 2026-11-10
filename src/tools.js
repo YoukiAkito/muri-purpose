@@ -48,7 +48,10 @@ const STATUS_SCHEMA = {
     intentDrives: { type: 'string', required: true },
     openIntentions: { type: 'integer', required: true },
     intentAskedAt: { type: 'string', required: true },
-    intentNextAt: { type: 'string', required: true }
+    intentNextAt: { type: 'string', required: true },
+    watchPicked: { type: 'integer', required: true },
+    watchStartAt: { type: 'string', required: true },
+    watchLastDay: { type: 'string', required: true }
   }
 };
 
@@ -337,6 +340,49 @@ export function registerPurposeTools(agentCtx, agent, service) {
       return { count: rows.length, items: items === '' ? '（还没动过手）' : items };
     },
     presentCall: () => ({ type: 'text', text: '看执行记录' })
+  }));
+
+  add(defineTool({
+    name: 'purpose_watchlist',
+    description: '看白天挑的片子清单：挑中了哪些、为什么想点开、看过的留了什么笔记。晚上看完想回顾时用。',
+    parameters: {
+      state: { type: 'string', description: '只看某种状态：candidate 待挑 / picked 挑了待看 / watched 看过 / dropped 放弃。不填就全都要。' },
+      limit: { type: 'integer', description: '看几条，默认 10，最多 100。' }
+    },
+    output: {
+      schema: {
+        oneOf: [{
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            count: { type: 'integer', required: true },
+            items: { type: 'string', required: true }
+          }
+        }, ERROR_SCHEMA]
+      },
+      render: renderValue
+    },
+    async execute(args, exec) {
+      if (exec.agent !== agent) return internalError();
+      if (typeof service.watchlist !== 'function') {
+        return { code: 'unavailable', message: '这个版本还没有待看清单。' };
+      }
+      const limit = Number.isFinite(args['limit']) ? args['limit'] : 10;
+      const state = typeof args['state'] === 'string' ? args['state'].trim() : '';
+      let rows;
+      try {
+        rows = service.watchlist({ state, limit });
+      } catch (error) {
+        return { code: 'invalid_args', message: error instanceof Error ? error.message : String(error) };
+      }
+      const items = rows.map((row) => {
+        const why = row.why === '' ? '' : ` / 为什么：${row.why}`;
+        const note = row.note === '' ? '' : ` / 笔记：${String(row.note).slice(0, 60)}`;
+        return `${row.state} ${row.bvid} ${String(row.title ?? '').slice(0, 40)}${why}${note}`;
+      }).join('\n');
+      return { count: rows.length, items: items === '' ? '（清单是空的）' : items };
+    },
+    presentCall: () => ({ type: 'text', text: '看待看清单' })
   }));
 
   return () => {

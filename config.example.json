@@ -134,6 +134,14 @@
       "order": "views",
       "size": 8,
       "maxQueryChars": 24
+    },
+    "watch": {
+      "enabled": true,
+      "maxCandidates": 40,
+      "pickLimit": 3,
+      "startAt": "21:00",
+      "watchLimit": 3,
+      "timeBoxMs": 600000
     }
   },
   "target": {

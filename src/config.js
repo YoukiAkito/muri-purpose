@@ -169,6 +169,25 @@ export const DEFAULT_CONFIG = {
       size: 8,
       /** 念头原文当搜索词时截多长（太长搜不出东西）。 */
       maxQueryChars: 24
+    },
+    /**
+     * 待看清单：白天翻标题时记下想看的，晚上再真去看。
+     *
+     * 白天那一步只看得到标题，不知道里面讲了什么；晚上真看要抽帧转台词，
+     * 一分钟起步，不能塞在 tick 里。所以拆成两步，中间隔一份清单。
+     */
+    watch: {
+      enabled: true,
+      /** 清单最多留多少条候选；超了砍最老的。 */
+      maxCandidates: 40,
+      /** 一次最多挑几条等着晚上看。 */
+      pickLimit: 3,
+      /** 晚上几点开始看（HH:MM，本机时区）。 */
+      startAt: '21:00',
+      /** 晚上一次最多看几条。 */
+      watchLimit: 3,
+      /** 看完一条最多允许多久（毫秒），超了就取消这次看。 */
+      timeBoxMs: 600_000
     }
   }
 };
@@ -320,6 +339,7 @@ export function resolveConfig({ platform = process.platform, env = process.env, 
   const intent = file.intent && typeof file.intent === 'object' ? file.intent : {};
   const external = file.external && typeof file.external === 'object' ? file.external : {};
   const topics = external.topics && typeof external.topics === 'object' ? external.topics : {};
+  const watch = external.watch && typeof external.watch === 'object' ? external.watch : {};
   const drives = file.drives && typeof file.drives === 'object' ? file.drives : {};
   const timeouts = file.timeouts && typeof file.timeouts === 'object' ? file.timeouts : {};
 
@@ -392,6 +412,20 @@ export function resolveConfig({ platform = process.platform, env = process.env, 
         order: typeof topics.order === 'string' && topics.order !== '' ? topics.order : DEFAULT_CONFIG.external.topics.order,
         size: intOf(topics.size, DEFAULT_CONFIG.external.topics.size, 1, 20),
         maxQueryChars: intOf(topics.maxQueryChars, DEFAULT_CONFIG.external.topics.maxQueryChars, 2, 80)
+      },
+      watch: {
+        enabled: typeof watch.enabled === 'boolean' ? watch.enabled : DEFAULT_CONFIG.external.watch.enabled,
+        maxCandidates: intOf(watch.maxCandidates, DEFAULT_CONFIG.external.watch.maxCandidates, 1, 200),
+        pickLimit: intOf(watch.pickLimit, DEFAULT_CONFIG.external.watch.pickLimit, 1, 10),
+        startAt: (() => {
+          try {
+            return parseClock(watch.startAt ?? DEFAULT_CONFIG.external.watch.startAt, 'watch.startAt');
+          } catch {
+            return DEFAULT_CONFIG.external.watch.startAt;
+          }
+        })(),
+        watchLimit: intOf(watch.watchLimit, DEFAULT_CONFIG.external.watch.watchLimit, 1, 10),
+        timeBoxMs: intOf(watch.timeBoxMs, DEFAULT_CONFIG.external.watch.timeBoxMs, 30_000, 3_600_000)
       }
     }
   };

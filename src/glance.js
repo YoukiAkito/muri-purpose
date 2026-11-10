@@ -108,7 +108,10 @@ export function materialsFromPopular(data, now = Date.now(), { perLane = PER_LAN
         kind: 'external_item',
         text: bits.join('，'),
         at: now,
-        source: 'bili-popular'
+        source: 'bili-popular',
+        // bvid/title 是给待看清单用的：标题写进素材给我看，bvid 留着晚上真去点开。
+        bvid: typeof item?.bvid === 'string' ? item.bvid : '',
+        title
       };
     })
     .filter((m) => m !== null);
@@ -137,7 +140,9 @@ export function materialsFromVideoSearch(data, now = Date.now(), { prefix = '视
         kind: 'external_item',
         text: bits.join('，'),
         at: now,
-        source
+        source,
+        bvid: typeof item?.bvid === 'string' ? item.bvid : '',
+        title
       };
     })
     .filter((m) => m !== null);

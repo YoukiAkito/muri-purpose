@@ -24,6 +24,18 @@ import { IntentRuntime } from './intent-runtime.js';
 import { IntentExecutor, resolveWorkerConfig, buildAskPrompt } from './intent-worker.js';
 import { describeDrives } from './drives.js';
 import { findBiliCli, glance, shouldGlance, recordGlance, lastGlanceAt, topicQueries } from './glance.js';
+import { recordCandidates, readWatchlist, pickCandidates, pickedForWatch } from './watchlist.js';
+import {
+  shouldWatchNow,
+  buildWatchPrompt,
+  watchRound,
+  buildNotesPrompt,
+  readWatchState,
+  shouldPickNow,
+  buildPickPrompt,
+  parsePickReply
+} from './watcher.js';
+import { lastAssistantTextOf } from './agenttext.js';
 import { materializeSessionLog, resolveSessionLog } from './sessionlog.js';
 import { readJson, readJsonl, writeJsonAtomic, toIso } from './util.js';
 
@@ -76,6 +88,10 @@ export async function apply(ctx) {
   const glancePath = join(config.dataDir, 'glance.jsonl');
   const biliCli = findBiliCli({ DSH_PURPOSE_BILI: config.external.biliCli });
 
+  /** 待看清单：白天挑、晚上看，中间隔的这份流水。 */
+  const watchlistPath = join(config.dataDir, 'watchlist.jsonl');
+  const watchStatePath = join(config.dataDir, 'watch-state.json');
+
   /** 循环节奏：卡多久算超时、被占用后多久重试。 */
   const tickTimeoutMs = Number.isFinite(config.timeouts?.tickMs) ? config.timeouts.tickMs : DEFAULT_TICK_TIMEOUT_MS;
   const busyRetryMs = Number.isFinite(config.timeouts?.busyRetryMs) ? config.timeouts.busyRetryMs : DEFAULT_BUSY_RETRY_MS;
@@ -105,7 +121,10 @@ export async function apply(ctx) {
       intentDrives: describeDrives(iv.drives),
       openIntentions: iv.openIntentions,
       intentAskedAt: iv.lastAskAt === '' ? '（还没问过）' : iv.lastAskAt,
-      intentNextAt: intentNextAt === null ? '（未安排）' : toIso(intentNextAt)
+      intentNextAt: intentNextAt === null ? '（未安排）' : toIso(intentNextAt),
+      watchPicked: pickedForWatch(watchlistPath, { limit: 99 }).length,
+      watchStartAt: config.external.watch.enabled ? config.external.watch.startAt : '（关着）',
+      watchLastDay: readWatchState(watchStatePath).lastDay ?? '（还没看过）'
     };
   };
 
@@ -274,6 +293,8 @@ export async function apply(ctx) {
   let timer = null;
   let stopped = false;
   let running = false;
+  /** 挑片的串行锁：出门翻完标题后台挑，同一时间只挑一趟。 */
+  let pickRunning = false;
 
   const schedule = (delayMs) => {
     if (stopped) return;
@@ -324,10 +345,23 @@ export async function apply(ctx) {
             });
             external = seen.materials;
             recordGlance(glancePath, { materials: seen.materials, sources: seen.sources, at: Date.now() });
+            // 顺手把能点开的记进待看清单——晚上要看的东西从这儿挑。
+            if (config.external.watch.enabled) {
+              const added = recordCandidates(watchlistPath, seen.materials, {
+                at: Date.now(),
+                maxCandidates: config.external.watch.maxCandidates
+              });
+              if (added > 0) log('info', `[watch] 待看清单新增 ${added} 条`);
+            }
             if (seen.materials.length > 0) {
               intent.satisfy('curiosity', 1);
               intent.persist();
               log('info', `[glance] 出去看了一眼：${seen.sources.join('+')}，${seen.materials.length} 条`);
+            }
+            // 翻完标题立刻挑：脑子里还有印象的时候挑最准，挑的理由也才写得出来。
+            // 不 await —— 挑片要开子会话，几十秒起步，不能把这次心跳卡在那儿。
+            if (config.external.watch.enabled && seen.materials.length > 0) {
+              void pickForTonight();
             }
           } else {
             log('info', `[glance] 没出去：${verdict.reason}`);
@@ -336,6 +370,9 @@ export async function apply(ctx) {
           log('warn', `[glance] 出门失败：${error instanceof Error ? error.message : String(error)}`);
         }
       }
+
+      // 晚上该看片了就看。自己带锁，不占这个 tick，看十来分钟也不影响下次心跳。
+      void watchTick();
 
       const result = await withTimeout(runTick({
         store,
@@ -398,7 +435,14 @@ export async function apply(ctx) {
     runs: (limit = 10) => {
       const rows = readJsonl(join(config.dataDir, 'intent-runs.jsonl'), Math.max(1, Math.min(200, Number(limit) || 10)));
       return rows.reverse();
-    }
+    },
+    /** 待看清单（折叠后的最新状态），给"我到底想看什么"这类回顾用。 */
+    watchlist: ({ state = '', limit = 10 } = {}) => {
+      const rows = readWatchlist(watchlistPath);
+      const filtered = state === '' ? rows : rows.filter((row) => row.state === state);
+      return filtered.slice(0, Math.max(1, Math.min(100, Number(limit) || 10)));
+    },
+    watchState: () => readWatchState(watchStatePath)
   };
   const registerOne = (agent) => {
     const id = agent?.id;
@@ -504,6 +548,155 @@ export async function apply(ctx) {
     }
   };
 
+  /**
+   * 开一个一次性会话说一句话，把它最后写的那段话拿回来。
+   *
+   * 跟 createWorker 的区别只在"要不要结果"：worker 干完活写日志就完了，
+   * 看视频那个必须把笔记交回来——所以这里等它静默之后回读事件流。
+   * 拿不到正文就返回空串，由调用方决定算不算失败。
+   */
+  const runOneShot = async ({ prompt, sessionPrefix = 'muri-purpose-task', timeBoxMs = 600_000 } = {}) => {
+    const defaultModel = ctx.get('agentDefaultModel', false);
+    const selection = typeof defaultModel?.currentSelection === 'function' ? defaultModel.currentSelection() : undefined;
+    if (selection === undefined || selection === null || typeof selection.provider !== 'string' || typeof selection.model !== 'string') {
+      throw new Error('拿不到默认模型选择');
+    }
+    const presets = ctx.get('agentPresets', false);
+    const presetId = typeof config.intent.workerPreset === 'string' ? config.intent.workerPreset : '';
+    const handle = await ctx.agents.create({
+      sessionId: `${sessionPrefix}-${randomUUID()}`,
+      agentOptions: {
+        provider: selection.provider,
+        model: selection.model,
+        ...(typeof selection.reasoningEffort === 'string' ? { reasoningEffort: selection.reasoningEffort } : {})
+      },
+      meta: { cwd: process.cwd() },
+      setup: async (agentCtx) => {
+        if (presets === undefined || typeof presets.mount !== 'function') return;
+        if (presetId !== '') await presets.mount(agentCtx, presetId);
+      }
+    });
+    try {
+      handle.agent.followup({ content: [{ type: 'text', text: prompt }], source: { kind: 'plugin:muri-purpose' } });
+      const timer = setTimeout(() => {
+        try {
+          handle.agent.cancel?.('time-box');
+        } catch {
+          // 取消失败无所谓，下面 whenIdle 会等它自己停。
+        }
+      }, Math.max(10_000, Number(timeBoxMs) || 600_000));
+      if (typeof timer.unref === 'function') timer.unref();
+      try {
+        await handle.agent.whenIdle();
+      } finally {
+        clearTimeout(timer);
+      }
+      // 正文要从事件流回读：会话对象没有返回值，只有它说过的话。
+      return { text: lastAssistantTextOf(handle.agent), steps: 0 };
+    } finally {
+      try {
+        handle.dispose?.();
+      } catch {
+        // 释放失败不影响记账。
+      }
+    }
+  };
+
+  /**
+   * 白天挑片：把这次翻到的候选丢给一个一次性会话，让它挑几条并写理由。
+   *
+   * 为什么开子会话而不是自己做：挑片子要看二十个标题，会把主对话的上下文
+   * 塞满一堆跟我没关系的东西。挑完只落一份清单，中间那些标题不值得留在对话里。
+   *
+   * 失败不抛：挑不成只是今晚没得看，不该影响投递心跳。
+   */
+  const pickForTonight = async () => {
+    if (stopped || pickRunning) return;
+    pickRunning = true;
+    try {
+      const pending = pickedForWatch(watchlistPath, { limit: 99 });
+      const verdict = shouldPickNow({ picked: pending, limit: config.external.watch.pickLimit });
+      if (!verdict.pick) {
+        log('info', `[watch] 不挑了：${verdict.reason}`);
+        return;
+      }
+      const fresh = readWatchlist(watchlistPath)
+        .filter((row) => row.state === 'candidate')
+        .slice(0, 24);
+      if (fresh.length === 0) {
+        log('info', '[watch] 清单里没有能点开的候选，跳过挑片');
+        return;
+      }
+      const prompt = buildPickPrompt(fresh, { pickLimit: config.external.watch.pickLimit });
+      const reply = await runOneShot({ prompt, sessionPrefix: 'muri-purpose-pick', timeBoxMs: 300_000 });
+      const picks = parsePickReply(reply.text, { limit: config.external.watch.pickLimit });
+      if (picks.length === 0) {
+        log('info', '[watch] 它这次一条都没挑');
+        return;
+      }
+      const { picked, missing } = pickCandidates(watchlistPath, picks, { at: Date.now() });
+      log('info', `[watch] 挑中 ${picked.length} 条${missing.length > 0 ? `（${missing.length} 条对不上清单）` : ''}`);
+    } catch (error) {
+      log('warn', `[watch] 挑片失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      pickRunning = false;
+    }
+  };
+
+  /**
+   * 晚上看片：把挑中的一条条打开看，看完把笔记交给主会话。
+   *
+   * 看一条开一个子会话，一条看不成不影响下一条。
+   * 全部看完只投一条提示进主会话——不是每条投一次，不然一晚上要被打扰三次。
+   */
+  const watchTick = async () => {
+    if (stopped || watchRunning) return;
+    if (!config.external.watch.enabled || biliCli === '') return;
+    watchRunning = true;
+    try {
+      const now = Date.now();
+      const zone = localZoneOffsetMinutes(now);
+      const state = readWatchState(watchStatePath);
+      const pending = pickedForWatch(watchlistPath, { limit: config.external.watch.watchLimit });
+      const verdict = shouldWatchNow({
+        now,
+        startAt: config.external.watch.startAt,
+        lastDay: typeof state.lastDay === 'string' ? state.lastDay : '',
+        zoneOffsetMinutes: zone,
+        picked: pending
+      });
+      if (!verdict.watch) {
+        log('info', `[watch] 不看：${verdict.reason}`);
+        return;
+      }
+      const round = await watchRound({
+        watchlistPath,
+        statePath: watchStatePath,
+        now,
+        limit: config.external.watch.watchLimit,
+        timeBoxMs: config.external.watch.timeBoxMs,
+        zoneOffsetMinutes: zone,
+        log,
+        watchOne: async (row) => {
+          const prompt = buildWatchPrompt(row);
+          const reply = await runOneShot({ prompt, sessionPrefix: 'muri-purpose-watch', timeBoxMs: row.timeBoxMs });
+          return reply.text;
+        }
+      });
+      const prompt = buildNotesPrompt(round.watched, { now });
+      if (prompt === '') {
+        log('info', '[watch] 看完一条笔记都没拿到，今晚不说了');
+        return;
+      }
+      const outcome = await deliver({ prompt });
+      log('info', `[watch] 看完 ${round.watched.length} 条，笔记投递 ${outcome}`);
+    } catch (error) {
+      log('warn', `[watch] 看片失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      watchRunning = false;
+    }
+  };
+
   const executor = new IntentExecutor({
     createWorker,
     runsPath: join(config.dataDir, 'intent-runs.jsonl'),
@@ -513,6 +706,9 @@ export async function apply(ctx) {
   /** 念头评估的定时器与串行锁（跟投递心跳那套分开，互不阻塞）。 */
   let intentTimer = null;
   let intentRunning = false;
+
+  /** 晚上看片的串行锁：一次只跑一轮，别两条流同时开子会话。 */
+  let watchRunning = false;
 
   const intentTick = async () => {
     if (stopped || intentRunning) return;

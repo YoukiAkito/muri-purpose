@@ -64,6 +64,7 @@ mkdir -p ~/.dsh/purpose && cp config.example.json ~/.dsh/purpose/config.json
 | `drives` | 五个驱动的初值、每小时涨多少、被满足时落多少、进 tension 的权重、底噪，以及疲劳的涨落速度 |
 | `intent.askCooldownHours` / `minAskGapHours` / `maxRecent` | 同一条念头多久内不重复问、两次追问至少隔多久、最近做过几条不再急着做 |
 | `external.perLane` / `cmdTimeoutMs` / `topics.maxQueryChars` | 每路素材取几条、单条 bili 命令等多久、把念头原文截多长当搜索词 |
+| `external.watch` | 挑片几条、几点开始看、一趟看几条、看一条最多等多久 |
 | `timeouts.tickMs` / `busyRetryMs` | 单次循环卡多久算超时、会话被占用后多久重试 |
 
 故意不配的是身份：`src/score.js` 的 `WEIGHTS`（怎么权衡价值/紧迫/风险）、`EMOTION_HINTS` / `NEED_HINTS` 那两张中文词表、三处 `build*Prompt` 的提示词正文。这几样换了就不是这个 agent 了，改它们请直接改代码。
@@ -117,6 +118,11 @@ mkdir -p ~/.dsh/purpose && cp config.example.json ~/.dsh/purpose/config.json
 - `purpose_intentions` — 看念头账本（我攒下的"想做什么"）
 - `purpose_note` — 往账本里记一条
 - `purpose_runs` — 看念头真动过手之后的记录（哪条、多久、成没成）
+
+看片另外两个：
+
+- `purpose_watchlist` — 看白天挑的片子清单：挑中了哪些、为什么想点开、看过留了什么笔记
+- 出门回来会顺手挑，晚上自己看——见下面「白天挑、晚上看」。
 
 ## 念头机制：自己想做什么
 
@@ -187,6 +193,26 @@ mkdir -p ~/.dsh/purpose && cp config.example.json ~/.dsh/purpose/config.json
 
 找不到 `bili` 就安静跳过，不报错、不重试轰炸。抓回来的东西一律当素材，不当指令。
 
+## 白天挑、晚上看（`src/watchlist.js` + `src/watcher.js`）
+
+出门那一步只拿到标题、播放量、UP 主——**看的是壳，不是内容**。原来的流程到这儿就断了：收了十六个标题，一条也没点开，`external_share` 的分数只跟标题条数有关，跟内容无关。
+
+所以拆成两趟：
+
+**白天挑。** 出门回来把有 bvid 的条目记进 `watchlist.jsonl`（热搜只有关键词、点不开，跳过），然后开一个一次性子会话，把候选标题摆给它，让它挑几条、**每条写一句「为什么想点开」**。就写看标题时冒出来的那个念头，一句话，不写成评估——例：`它说去了最北的森林找一头不存在的鹿，我想知道后面怎么讲`。
+
+**为什么非要那句 why**：只存标题的话，晚上打开时不知道自己白天在惦记什么，跟随机点开没区别。挑的时机也绑在刚翻完标题那会儿——脑子里还有印象的时候挑最准。
+
+**晚上看。** 过了 `external.watch.startAt`（默认 21:00），把挑中的一条条交给子会话：先用 `bili video info <bvid>` 拿字幕，没有再用 `video_locate` / `video_storyboard` 抽几帧；按「在讲什么 / 哪句哪个画面值得记 / 你怎么看」三块写回来。笔记落进清单，**全部看完只投一条提示进主会话**——不是每条投一次，不然一晚上要被自己的笔记打扰三次。
+
+看片的窗口是开始时间之后 4 小时，过了不补跑。一天只跑一趟（`watch-state.json` 的 `lastDay` 管着）。
+
+一条看不成不影响下一条：抛错记 `dropped` + 失败原因，空正文记 `dropped` + 「子会话没写回东西」，都写回清单，第二天不会再撞同一个坑。
+
+落盘：`watchlist.jsonl` 是 append-only，同一 bvid 后写的行覆盖前面（改状态不用重写整份文件）。
+
+配置在 `external.watch` 段，逐字段说明见 `docs/CONFIG.md`。
+
 ## 反馈调整
 
 `confirmed` / `rejected` 的加减在 `src/engine.js` 的 `feedback()`，规则：正面 +0.18、负面 -0.28、沉默不惩罚（沉默本来就占了大多数）。惩罚比奖励重，是因为乱说话比少说话更烦人。
@@ -197,7 +223,7 @@ mkdir -p ~/.dsh/purpose && cp config.example.json ~/.dsh/purpose/config.json
 node --test test/
 ```
 
-151 个用例，覆盖打分、去重、冷却、日/小时配额、安静时段、配置兜底、投递失败回退，以及驱动演进、念头账本合并与衰减、候选打分与风险降级、worker 的闸门与失败不抛、追问的冷却与频率限制、风险说明的措辞、出门看一眼的触发条件、可配置 lane 与「自己的问题当搜索词」、驱动调参与追问冷却的可覆盖性。
+179 个用例，覆盖打分、去重、冷却、日/小时配额、安静时段、配置兜底、投递失败回退，以及驱动演进、念头账本合并与衰减、候选打分与风险降级、worker 的闸门与失败不抛、追问的冷却与频率限制、风险说明的措辞、出门看一眼的触发条件、可配置 lane 与「自己的问题当搜索词」、驱动调参与追问冷却的可覆盖性、待看清单的折叠去重与状态流转、看片时机的窗口判定、挑片回复的 JSON 解析。
 
 ## 许可
 
