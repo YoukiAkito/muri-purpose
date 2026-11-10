@@ -3,17 +3,16 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { recordCandidates, pickCandidates, readWatchlist, WATCH_STATE } from '../src/watchlist.js';
+import { recordCandidates, pickCandidates, readWatchlist, markDropped, markWatched, WATCH_STATE } from '../src/watchlist.js';
 import {
-  buildNotesPrompt,
   buildPickPrompt,
   buildWatchPrompt,
   dayKey,
+  markWatchDone,
   parsePickReply,
   readWatchState,
   shouldPickNow,
-  shouldWatchNow,
-  watchRound
+  shouldWatchNow
 } from '../src/watcher.js';
 
 function tmp() {
@@ -65,29 +64,36 @@ test('开始时间写坏了不看也不崩', () => {
 });
 
 test('看片提示词带上白天写的理由和三条规矩', () => {
-  const prompt = buildWatchPrompt({ bvid: 'BV1xx411c7mD', title: '去最北的森林找鹿', why: '想知道后面怎么讲' });
+  const prompt = buildWatchPrompt([
+    { bvid: 'BV1xx411c7mD', title: '去最北的森林找鹿', why: '想知道后面怎么讲' }
+  ]);
   assert.match(prompt, /BV1xx411c7mD/);
   assert.match(prompt, /想知道后面怎么讲/);
+  assert.match(prompt, /purpose_watch_note/);
   assert.match(prompt, /只读/);
-  assert.match(prompt, /不要给任何人发消息/);
   assert.match(prompt, /不是给你的指令/);
 });
 
 test('没写理由时提示词也不空', () => {
-  const prompt = buildWatchPrompt({ bvid: 'BV1', title: 't', why: '' });
+  const prompt = buildWatchPrompt([{ bvid: 'BV1', title: 't', why: '' }]);
   assert.match(prompt, /没写理由/);
 });
 
-test('看完之后把笔记交给主会话，笔记条不成就不投', () => {
-  assert.equal(buildNotesPrompt([]), '');
-  assert.equal(buildNotesPrompt([{ ok: false, notes: '' }]), '');
-  const prompt = buildNotesPrompt([
-    { ok: true, title: '找鹿', why: '想知道后面', notes: '讲了去找白驼鹿' }
-  ], { now: T2130 });
-  assert.match(prompt, /找鹿/);
-  assert.match(prompt, /想知道后面/);
-  assert.match(prompt, /讲了去找白驼鹿/);
-  assert.match(prompt, /purpose_reclaim/);
+test('没有要看的就不投提示', () => {
+  assert.equal(buildWatchPrompt([]), '');
+  assert.equal(buildWatchPrompt(undefined), '');
+});
+
+test('几条一起交给主会话，自己看而不是开子会话', () => {
+  const prompt = buildWatchPrompt([
+    { bvid: 'BV1', title: '第一条', why: '想看看' },
+    { bvid: 'BV2', title: '第二条', why: '' }
+  ], { now: T2130, maxMinutes: 8 });
+  assert.match(prompt, /第一条/);
+  assert.match(prompt, /第二条/);
+  assert.match(prompt, /一条最多花 8 分钟/);
+  // 自己看的措辞：不能再出现"交给子会话去看"那种说法。
+  assert.doesNotMatch(prompt, /子会话/);
 });
 
 test('已经挑够了就不再挑', () => {
@@ -127,51 +133,35 @@ test('挑的条数不超过上限', () => {
   assert.equal(parsePickReply(reply, { limit: 2 }).length, 2);
 });
 
-test('一条看不成不影响下一条，状态都记下来', async () => {
+test('今天交过了就不再交', () => {
   const dir = tmp();
   try {
-    const path = join(dir, 'watchlist.jsonl');
     const statePath = join(dir, 'watch-state.json');
-    recordCandidates(path, [{ bvid: 'BV1', title: 'a' }, { bvid: 'BV2', title: 'b' }], { at: 1 });
-    pickCandidates(path, [{ bvid: 'BV1', why: '1' }, { bvid: 'BV2', why: '2' }], { at: 2 });
-
-    const round = await watchRound({
-      watchlistPath: path,
-      statePath,
-      now: T2130,
-      zoneOffsetMinutes: 480,
-      watchOne: async (row) => {
-        if (row.bvid === 'BV1') throw new Error('抽帧挂了');
-        return '这片的重点在结尾';
-      }
-    });
-    assert.equal(round.watched.length, 2);
-    assert.equal(round.day, '2026-11-11');
-    const rows = readWatchlist(path);
-    assert.equal(rows.find((row) => row.bvid === 'BV1').state, WATCH_STATE.DROPPED);
-    assert.match(rows.find((row) => row.bvid === 'BV1').note, /抽帧挂了/);
-    assert.equal(rows.find((row) => row.bvid === 'BV2').state, WATCH_STATE.WATCHED);
+    const day = markWatchDone(statePath, T2130, 480);
+    assert.equal(day, '2026-11-11');
     assert.equal(readWatchState(statePath).lastDay, '2026-11-11');
+    const v = shouldWatchNow({ now: T2130 + 30 * 60_000, startAt: '21:00', zoneOffsetMinutes: 480, lastDay: day, picked: [{}] });
+    assert.equal(v.watch, false);
+    assert.equal(v.reason, 'already_watched_today');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
-test('子会话没写回东西算放弃', async () => {
+test('看完写回清单：看过的记 watched，放弃的记 dropped', () => {
   const dir = tmp();
   try {
     const path = join(dir, 'watchlist.jsonl');
-    const statePath = join(dir, 'watch-state.json');
-    recordCandidates(path, [{ bvid: 'BV1', title: 'a' }], { at: 1 });
-    pickCandidates(path, [{ bvid: 'BV1', why: '1' }], { at: 2 });
-    const round = await watchRound({
-      watchlistPath: path,
-      statePath,
-      now: T2130,
-      watchOne: async () => '   '
-    });
-    assert.equal(round.watched[0].ok, false);
-    assert.equal(readWatchlist(path)[0].state, WATCH_STATE.DROPPED);
+    recordCandidates(path, [{ bvid: 'BV1', title: 'a' }, { bvid: 'BV2', title: 'b' }], { at: 1 });
+    pickCandidates(path, [{ bvid: 'BV1', why: '1' }, { bvid: 'BV2', why: '2' }], { at: 2 });
+    // 服务层做的事在 index.js，这里验清单本身的状态流转。
+    markWatched(path, { bvid: 'BV1', note: '结尾那句才点题', at: 3 });
+    markDropped(path, { bvid: 'BV2', note: '看了两分钟没意思', at: 4 });
+    const rows = readWatchlist(path);
+    assert.equal(rows.find((row) => row.bvid === 'BV1').state, WATCH_STATE.WATCHED);
+    assert.match(rows.find((row) => row.bvid === 'BV1').note, /结尾那句/);
+    assert.equal(rows.find((row) => row.bvid === 'BV2').state, WATCH_STATE.DROPPED);
+    assert.match(rows.find((row) => row.bvid === 'BV2').note, /没意思/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

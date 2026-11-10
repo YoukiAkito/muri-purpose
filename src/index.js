@@ -24,12 +24,11 @@ import { IntentRuntime } from './intent-runtime.js';
 import { IntentExecutor, resolveWorkerConfig, buildAskPrompt } from './intent-worker.js';
 import { describeDrives } from './drives.js';
 import { findBiliCli, glance, shouldGlance, recordGlance, lastGlanceAt, topicQueries } from './glance.js';
-import { recordCandidates, readWatchlist, pickCandidates, pickedForWatch } from './watchlist.js';
+import { recordCandidates, readWatchlist, pickCandidates, pickedForWatch, markWatched, markDropped } from './watchlist.js';
 import {
   shouldWatchNow,
   buildWatchPrompt,
-  watchRound,
-  buildNotesPrompt,
+  markWatchDone,
   readWatchState,
   shouldPickNow,
   buildPickPrompt,
@@ -442,7 +441,15 @@ export async function apply(ctx) {
       const filtered = state === '' ? rows : rows.filter((row) => row.state === state);
       return filtered.slice(0, Math.max(1, Math.min(100, Number(limit) || 10)));
     },
-    watchState: () => readWatchState(watchStatePath)
+    watchState: () => readWatchState(watchStatePath),
+    /** 看完一条：把笔记写回清单；drop=true 表示没看下去，记成放弃。 */
+    watchNote: ({ bvid, note = '', drop = false } = {}) => {
+      const write = drop === true ? markDropped : markWatched;
+      const ok = write(watchlistPath, { bvid, note, at: Date.now() });
+      if (!ok) return { ok: false, message: `清单里没有 ${bvid} 这条。` };
+      log('info', `[watch] 记下 ${bvid}${drop === true ? '（放弃）' : ''}`);
+      return { ok: true, state: drop === true ? 'dropped' : 'watched', message: drop === true ? '记成放弃了。' : '记下了。' };
+    }
   };
   const registerOne = (agent) => {
     const id = agent?.id;
@@ -644,10 +651,13 @@ export async function apply(ctx) {
   };
 
   /**
-   * 晚上看片：把挑中的一条条打开看，看完把笔记交给主会话。
+   * 晚上看片：把挑中的几条**交给主会话自己看**。
    *
-   * 看一条开一个子会话，一条看不成不影响下一条。
-   * 全部看完只投一条提示进主会话——不是每条投一次，不然一晚上要被打扰三次。
+   * 不替我看：让子会话看完再交一份笔记回来，我拿到的还是摘要，跟只看标题
+   * 是同一种毛病。所以这里只投一条提示进去，字幕、抽帧、写笔记都由我在
+   * 主会话里当场做完。一天只交一趟，别把自己拆成闹钟。
+   *
+   * 交完立刻记 lastDay：不然主会话还没看完，下个 tick 又投一条。
    */
   const watchTick = async () => {
     if (stopped || watchRunning) return;
@@ -669,29 +679,23 @@ export async function apply(ctx) {
         log('info', `[watch] 不看：${verdict.reason}`);
         return;
       }
-      const round = await watchRound({
-        watchlistPath,
-        statePath: watchStatePath,
+      const prompt = buildWatchPrompt(pending, {
         now,
-        limit: config.external.watch.watchLimit,
-        timeBoxMs: config.external.watch.timeBoxMs,
-        zoneOffsetMinutes: zone,
-        log,
-        watchOne: async (row) => {
-          const prompt = buildWatchPrompt(row);
-          const reply = await runOneShot({ prompt, sessionPrefix: 'muri-purpose-watch', timeBoxMs: row.timeBoxMs });
-          return reply.text;
-        }
+        maxMinutes: Math.max(1, Math.round(config.external.watch.timeBoxMs / 60_000))
       });
-      const prompt = buildNotesPrompt(round.watched, { now });
       if (prompt === '') {
-        log('info', '[watch] 看完一条笔记都没拿到，今晚不说了');
+        log('info', '[watch] 没有要看的，跳过');
         return;
       }
       const outcome = await deliver({ prompt });
-      log('info', `[watch] 看完 ${round.watched.length} 条，笔记投递 ${outcome}`);
+      if (outcome === 'sent') {
+        markWatchDone(watchStatePath, now, zone);
+        log('info', `[watch] 今晚 ${pending.length} 条交给主会话了`);
+      } else {
+        log('info', `[watch] 投递没成（${outcome}），下个 tick 再试`);
+      }
     } catch (error) {
-      log('warn', `[watch] 看片失败：${error instanceof Error ? error.message : String(error)}`);
+      log('warn', `[watch] 看片投递失败：${error instanceof Error ? error.message : String(error)}`);
     } finally {
       watchRunning = false;
     }

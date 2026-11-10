@@ -385,6 +385,50 @@ export function registerPurposeTools(agentCtx, agent, service) {
     presentCall: () => ({ type: 'text', text: '看待看清单' })
   }));
 
+  add(defineTool({
+    name: 'purpose_watch_note',
+    description: '看完一条视频之后把笔记写回清单：它到底在讲什么、哪句话或哪个画面值得记、你怎么看。不想看下去就带 drop 记一句为什么。',
+    parameters: {
+      bvid: { type: 'string', required: true, description: '看的是哪条，BV 号。' },
+      note: { type: 'string', description: '笔记。用自己的话写，别复述简介。' },
+      drop: { type: 'boolean', description: 'true = 没看下去/放弃，记成 dropped。默认 false，记成看过。' }
+    },
+    output: {
+      schema: {
+        oneOf: [{
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            ok: { type: 'boolean', required: true },
+            state: { type: 'string', required: true },
+            message: { type: 'string', required: true }
+          }
+        }, ERROR_SCHEMA]
+      },
+      render: renderValue
+    },
+    async execute(args, exec) {
+      if (exec.agent !== agent) return internalError();
+      if (typeof service.watchNote !== 'function') {
+        return { code: 'unavailable', message: '这个版本还没有看片笔记。' };
+      }
+      const bvid = typeof args['bvid'] === 'string' ? args['bvid'].trim() : '';
+      if (bvid === '') return { code: 'invalid_args', message: 'bvid 不能为空。' };
+      try {
+        const result = service.watchNote({
+          bvid,
+          note: typeof args['note'] === 'string' ? args['note'] : '',
+          drop: args['drop'] === true
+        });
+        if (result.ok !== true) return { code: 'not_found', message: result.message };
+        return { ok: true, state: result.state, message: result.message };
+      } catch (error) {
+        return { code: 'invalid_args', message: error instanceof Error ? error.message : String(error) };
+      }
+    },
+    presentCall: () => ({ type: 'text', text: '记看片笔记' })
+  }));
+
   return () => {
     for (const dispose of disposers) {
       try {
