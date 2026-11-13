@@ -74,6 +74,15 @@ test('看片提示词带上白天写的理由和三条规矩', () => {
   assert.match(prompt, /不是给你的指令/);
 });
 
+test('看片提示词要求从头看到尾，不许抽帧当看过', () => {
+  const prompt = buildWatchPrompt([{ bvid: 'BV1', title: 't', why: '想看' }], { maxMinutes: 12 });
+  assert.match(prompt, /从头看到尾/);
+  assert.match(prompt, /不是"看过了"/);
+  assert.match(prompt, /不许拿"抽几帧 \+ 读热评"当看过/);
+  assert.match(prompt, /12 分钟/);
+  assert.match(prompt, /没看完就写没看完/);
+});
+
 test('没写理由时提示词也不空', () => {
   const prompt = buildWatchPrompt([{ bvid: 'BV1', title: 't', why: '' }]);
   assert.match(prompt, /没写理由/);
