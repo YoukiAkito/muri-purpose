@@ -16,6 +16,7 @@
 import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
 import { resolveConfig, isInQuietHours, localZoneOffsetMinutes, parseClock, resolveLane } from './config.js';
 import { PurposeStore } from './store.js';
 import { tick as runTick, nextGapMs } from './engine.js';
@@ -34,6 +35,7 @@ import {
   buildPickPrompt,
   parsePickReply
 } from './watcher.js';
+import { recordTrends, trendsForDay, shouldCollectTrends, buildTrendPrompt, readTrendsState, markTrendsDone } from './trends.js';
 import { lastAssistantTextOf } from './agenttext.js';
 import { materializeSessionLog, resolveSessionLog } from './sessionlog.js';
 import { readJson, readJsonl, writeJsonAtomic, toIso } from './util.js';
@@ -91,6 +93,11 @@ export async function apply(ctx) {
   const watchlistPath = join(config.dataDir, 'watchlist.jsonl');
   const watchStatePath = join(config.dataDir, 'watch-state.json');
 
+  /** 热梗：出门顺手存标题，晚上整理成稿子。稿子在 ~/.dsh/trends/，不进长期记忆。 */
+  const trendsPath = join(config.dataDir, 'trends.jsonl');
+  const trendsStatePath = join(config.dataDir, 'trends-state.json');
+  const trendsDir = process.env.DSH_PURPOSE_TRENDS_DIR || join(homedir(), '.dsh', 'trends');
+
   /** 循环节奏：卡多久算超时、被占用后多久重试。 */
   const tickTimeoutMs = Number.isFinite(config.timeouts?.tickMs) ? config.timeouts.tickMs : DEFAULT_TICK_TIMEOUT_MS;
   const busyRetryMs = Number.isFinite(config.timeouts?.busyRetryMs) ? config.timeouts.busyRetryMs : DEFAULT_BUSY_RETRY_MS;
@@ -123,7 +130,9 @@ export async function apply(ctx) {
       intentNextAt: intentNextAt === null ? '（未安排）' : toIso(intentNextAt),
       watchPicked: pickedForWatch(watchlistPath, { limit: 99 }).length,
       watchStartAt: config.external.watch.enabled ? config.external.watch.startAt : '（关着）',
-      watchLastDay: readWatchState(watchStatePath).lastDay ?? '（还没看过）'
+      watchLastDay: readWatchState(watchStatePath).lastDay ?? '（还没看过）',
+      trendsStartAt: config.external.trends.enabled ? config.external.trends.startAt : '（关着）',
+      trendsLastDay: readTrendsState(trendsStatePath).lastDay ?? '（还没写过）'
     };
   };
 
@@ -352,6 +361,11 @@ export async function apply(ctx) {
               });
               if (added > 0) log('info', `[watch] 待看清单新增 ${added} 条`);
             }
+            // 热搜/热门的标题原样存一份，晚上整理成热梗稿。不判断、不加工。
+            if (config.external.trends.enabled) {
+              const got = recordTrends(trendsPath, { materials: seen.materials, at: Date.now() });
+              if (got > 0) log('info', `[trends] 收了 ${got} 条素材`);
+            }
             if (seen.materials.length > 0) {
               intent.satisfy('curiosity', 1);
               intent.persist();
@@ -372,6 +386,9 @@ export async function apply(ctx) {
 
       // 晚上该看片了就看。自己带锁，不占这个 tick，看十来分钟也不影响下次心跳。
       void watchTick();
+
+      // 该整理热梗了就整理。同样自带锁，跟看片错开时间点（21:00 看片 / 21:30 热梗）。
+      void trendsTick();
 
       const result = await withTimeout(runTick({
         store,
@@ -442,6 +459,17 @@ export async function apply(ctx) {
       return filtered.slice(0, Math.max(1, Math.min(100, Number(limit) || 10)));
     },
     watchState: () => readWatchState(watchStatePath),
+    /** 今天收的热梗素材（标题原文），写完稿之前看一眼。 */
+    trends: ({ limit = 40 } = {}) =>
+      trendsForDay(trendsPath, { now: Date.now(), zoneOffsetMinutes: localZoneOffsetMinutes(Date.now()) })
+        .slice(0, Math.max(1, Math.min(60, Number(limit) || 40))),
+    trendsState: () => readTrendsState(trendsStatePath),
+    /** 今天这份热梗稿写完了。不记的话下个 tick 还会催。 */
+    trendsDone: ({ count = 0 } = {}) => {
+      const now = Date.now();
+      markTrendsDone(trendsStatePath, { now, zoneOffsetMinutes: localZoneOffsetMinutes(now), count: Number(count) || 0 });
+      return true;
+    },
     /** 看完一条：把笔记写回清单；drop=true 表示没看下去，记成放弃。 */
     watchNote: ({ bvid, note = '', drop = false } = {}) => {
       const write = drop === true ? markDropped : markWatched;
@@ -701,6 +729,56 @@ export async function apply(ctx) {
     }
   };
 
+  /**
+   * 热梗整理：把今天出门收到的标题交给主会话，写成一份 markdown。
+   *
+   * 跟看片一样不交子会话：查出处、判断哪个梗能用，是判断活，
+   * 子会话交回来的摘要等于别人替我判断过了。一天一趟，写完立刻记账。
+   */
+  const trendsTick = async () => {
+    if (stopped || trendsRunning) return;
+    if (!config.external.trends.enabled || biliCli === '') return;
+    trendsRunning = true;
+    try {
+      const now = Date.now();
+      const zone = localZoneOffsetMinutes(now);
+      const state = readTrendsState(trendsStatePath);
+      const rows = trendsForDay(trendsPath, { now, zoneOffsetMinutes: zone });
+      const verdict = shouldCollectTrends({
+        now,
+        startAt: config.external.trends.startAt,
+        lastDay: typeof state.lastDay === 'string' ? state.lastDay : '',
+        zoneOffsetMinutes: zone,
+        materials: rows.length
+      });
+      if (!verdict.collect) {
+        log('info', `[trends] 不整理：${verdict.reason}`);
+        return;
+      }
+      const prompt = buildTrendPrompt({
+        date: verdict.date ?? '',
+        rows,
+        outPath: join(trendsDir, `${verdict.date ?? ''}.md`),
+        maxItems: config.external.trends.maxItems
+      });
+      if (prompt === '') {
+        log('info', '[trends] 今天没素材，跳过');
+        return;
+      }
+      const outcome = await deliver({ prompt });
+      if (outcome === 'sent') {
+        markTrendsDone(trendsStatePath, { now, zoneOffsetMinutes: zone, count: rows.length });
+        log('info', `[trends] 今天 ${rows.length} 条素材交给主会话整理`);
+      } else {
+        log('info', `[trends] 投递没成（${outcome}），下个 tick 再试`);
+      }
+    } catch (error) {
+      log('warn', `[trends] 整理投递失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      trendsRunning = false;
+    }
+  };
+
   const executor = new IntentExecutor({
     createWorker,
     runsPath: join(config.dataDir, 'intent-runs.jsonl'),
@@ -713,6 +791,9 @@ export async function apply(ctx) {
 
   /** 晚上看片的串行锁：一次只跑一轮，别两条流同时开子会话。 */
   let watchRunning = false;
+
+  /** 热梗整理的串行锁，同上。 */
+  let trendsRunning = false;
 
   const intentTick = async () => {
     if (stopped || intentRunning) return;

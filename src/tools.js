@@ -51,7 +51,9 @@ const STATUS_SCHEMA = {
     intentNextAt: { type: 'string', required: true },
     watchPicked: { type: 'integer', required: true },
     watchStartAt: { type: 'string', required: true },
-    watchLastDay: { type: 'string', required: true }
+    watchLastDay: { type: 'string', required: true },
+    trendsStartAt: { type: 'string', required: true },
+    trendsLastDay: { type: 'string', required: true }
   }
 };
 
@@ -427,6 +429,80 @@ export function registerPurposeTools(agentCtx, agent, service) {
       }
     },
     presentCall: () => ({ type: 'text', text: '记看片笔记' })
+  }));
+
+  add(defineTool({
+    name: 'purpose_trends',
+    description: '看今天出门收到的热梗素材（热搜标题、热门视频标题原样存下来的），整理成稿子之前先看一眼。',
+    parameters: {
+      limit: { type: 'integer', description: '看几条，默认 40，最多 60。' }
+    },
+    output: {
+      schema: {
+        oneOf: [{
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            count: { type: 'integer', required: true },
+            items: { type: 'string', required: true }
+          }
+        }, ERROR_SCHEMA]
+      },
+      render: renderValue
+    },
+    async execute(args, exec) {
+      if (exec.agent !== agent) return internalError();
+      if (typeof service.trends !== 'function') {
+        return { code: 'unavailable', message: '这个版本还没有热梗收档。' };
+      }
+      const limit = Number.isFinite(args['limit']) ? args['limit'] : 40;
+      let rows;
+      try {
+        rows = service.trends({ limit });
+      } catch (error) {
+        return { code: 'invalid_args', message: error instanceof Error ? error.message : String(error) };
+      }
+      const items = rows.map((row, i) => {
+        const bv = row.bvid === '' ? '' : `  [${row.bvid}]`;
+        return `${i + 1}. （${row.source === 'bili-hot' ? '热搜' : '热门'}）${row.text}${bv}`;
+      }).join('\n');
+      return { count: rows.length, items: items === '' ? '（今天还没收到素材）' : items };
+    },
+    presentCall: () => ({ type: 'text', text: '看热梗素材' })
+  }));
+
+  add(defineTool({
+    name: 'purpose_trends_done',
+    description: '今天这份热梗稿写完了，记一下。不记的话下个 tick 还会催。',
+    parameters: {
+      count: { type: 'integer', description: '这份里收了几条，随便填个整数。' }
+    },
+    output: {
+      schema: {
+        oneOf: [{
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            ok: { type: 'boolean', required: true },
+            message: { type: 'string', required: true }
+          }
+        }, ERROR_SCHEMA]
+      },
+      render: renderValue
+    },
+    async execute(args, exec) {
+      if (exec.agent !== agent) return internalError();
+      if (typeof service.trendsDone !== 'function') {
+        return { code: 'unavailable', message: '这个版本还没有热梗收档。' };
+      }
+      try {
+        service.trendsDone({ count: Number.isFinite(args['count']) ? args['count'] : 0 });
+        return { ok: true, message: '记下了，今天不再催。' };
+      } catch (error) {
+        return { code: 'invalid_args', message: error instanceof Error ? error.message : String(error) };
+      }
+    },
+    presentCall: () => ({ type: 'text', text: '记热梗稿写完' })
   }));
 
   return () => {

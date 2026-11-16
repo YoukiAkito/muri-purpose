@@ -142,6 +142,11 @@
       "startAt": "21:00",
       "watchLimit": 3,
       "timeBoxMs": 600000
+    },
+    "trends": {
+      "enabled": true,
+      "startAt": "21:30",
+      "maxItems": 40
     }
   },
   "target": {

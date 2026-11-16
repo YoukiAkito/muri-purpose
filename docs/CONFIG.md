@@ -206,6 +206,32 @@ mkdir -p ~/.dsh/purpose && cp config.example.json ~/.dsh/purpose/config.json
 - `<dataDir>/watchlist.jsonl` — 清单，append-only，同一 bvid 后写的行覆盖前面
 - `<dataDir>/watch-state.json` — `{lastDay, lastAt}`，一天只跑一趟靠它
 
+### `external.trends`：每天的热梗收档
+
+跟看片一样分两趟，但收的东西不一样：
+
+- **白天**：出门那趟顺手把热搜标题、热门视频标题**原样**存进 `trends.jsonl`。不判断、不加工——判断留到晚上。
+- **晚上**：过了 `startAt`，把当天收到的标题列成清单投进主会话，由我当场整理成一份 markdown，写到 `~/.dsh/trends/<日期>.md`。
+
+为什么要查出处：热搜上的梗大多是从别处挪过来的（选手原话 → 梗图 → 赛事结果 → 有人真的"同意"了），不挖这条链就只能写成新闻摘要，看不出一句"能用在哪"。所以提示词里要求每条热搜标「能用 / 不能用」、挑一条主梗挖来源链和触发事件、查不准就写「没查到出处」。
+
+**不进长期记忆**：这是即用即弃的稿子，不往 engram 塞。要留的是「今天这个梗是怎么来的」，不是梗本身。
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `true` | 关掉就不收也不写 |
+| `startAt` | `"21:30"` | 几点开始整理；跟看片的 `21:00` 错开半小时 |
+| `maxItems` | `40` | 一次最多列几条素材，多了截断 |
+
+窗口是 `startAt` 之后 5 小时，过了不补跑。当天没出门、一条素材都没有就跳过——不写空稿。
+
+落盘：
+- `<dataDir>/trends.jsonl` — 原始素材，append-only
+- `<dataDir>/trends-state.json` — `{lastDay, lastAt, count}`
+- `~/.dsh/trends/<YYYY-MM-DD>.md` — 整理好的成品（`DSH_PURPOSE_TRENDS_DIR` 可改目录）
+
+写完用 `purpose_trends_done` 记一下，不然下个 tick 还会催。看今天的素材用 `purpose_trends`。
+
 ---
 
 ## 环境变量
@@ -219,6 +245,7 @@ mkdir -p ~/.dsh/purpose && cp config.example.json ~/.dsh/purpose/config.json
 - `DSH_PURPOSE_TARGET` — 目标会话 id
 - `DSH_PURPOSE_INTENT_TICK` — 念头评估间隔（秒）
 - `DSH_PURPOSE_BILI` — bili CLI 路径
+- `DSH_PURPOSE_TRENDS_DIR` — 热梗稿落盘目录，默认 `~/.dsh/trends`
 
 ---
 

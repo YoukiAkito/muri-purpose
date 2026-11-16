@@ -188,6 +188,19 @@ export const DEFAULT_CONFIG = {
       watchLimit: 3,
       /** 看完一条最多允许多久（毫秒），超了就取消这次看。 */
       timeBoxMs: 600_000
+    },
+    /**
+     * 热梗收档：出门那趟顺手把热搜/热门原样存下来，晚上整理成一份 markdown。
+     *
+     * 存的是标题原文，不是判断。判断留到晚上写的时候做——查出处、看它为什么能火，
+     * 那是要花时间的活。也不进长期记忆，写成稿子用完就算。
+     */
+    trends: {
+      enabled: true,
+      /** 几点开始整理（HH:MM，本机时区）。 */
+      startAt: '21:30',
+      /** 一次整理最多列几条素材。 */
+      maxItems: 40
     }
   }
 };
@@ -340,6 +353,7 @@ export function resolveConfig({ platform = process.platform, env = process.env, 
   const external = file.external && typeof file.external === 'object' ? file.external : {};
   const topics = external.topics && typeof external.topics === 'object' ? external.topics : {};
   const watch = external.watch && typeof external.watch === 'object' ? external.watch : {};
+  const trends = external.trends && typeof external.trends === 'object' ? external.trends : {};
   const drives = file.drives && typeof file.drives === 'object' ? file.drives : {};
   const timeouts = file.timeouts && typeof file.timeouts === 'object' ? file.timeouts : {};
 
@@ -426,6 +440,17 @@ export function resolveConfig({ platform = process.platform, env = process.env, 
         })(),
         watchLimit: intOf(watch.watchLimit, DEFAULT_CONFIG.external.watch.watchLimit, 1, 10),
         timeBoxMs: intOf(watch.timeBoxMs, DEFAULT_CONFIG.external.watch.timeBoxMs, 30_000, 3_600_000)
+      },
+      trends: {
+        enabled: typeof trends.enabled === 'boolean' ? trends.enabled : DEFAULT_CONFIG.external.trends.enabled,
+        startAt: (() => {
+          try {
+            return parseClock(trends.startAt ?? DEFAULT_CONFIG.external.trends.startAt, 'trends.startAt');
+          } catch {
+            return DEFAULT_CONFIG.external.trends.startAt;
+          }
+        })(),
+        maxItems: intOf(trends.maxItems, DEFAULT_CONFIG.external.trends.maxItems, 1, 60)
       }
     }
   };
